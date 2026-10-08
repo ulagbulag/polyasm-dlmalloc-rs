@@ -1,10 +1,22 @@
 use crate::Allocator;
-#[cfg(target_arch = "wasm32")]
-use core::arch::wasm32 as wasm;
-#[cfg(target_arch = "wasm64")]
-use core::arch::wasm64 as wasm;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+mod wasm {
+    cfg_select! {
+        target_abi = "polyasm" => {
+            pub fn memory_grow(_memory: u32, pages: usize) -> usize {
+                core::polyasm::intrinsics::emit_memory_grow(pages)
+            }
+        }
+        target_arch = "wasm32" => {
+            pub use core::arch::wasm32::*;
+        }
+        target_arch = "wasm64" => {
+            pub use core::arch::wasm64::*;
+        }
+    }
+}
 
 #[cfg(target_os = "unknown")]
 extern "C" {
@@ -47,12 +59,12 @@ fn try_donate_preexisting(
     chunk
 }
 
-fn alloc_via_grow(size: usize, page_size: usize) -> (*mut u8, usize, u32) {
+fn alloc_via_grow(size: usize, page_size: usize) -> Option<(ptr::NonNull<u8>, usize, u32)> {
     let pages = size.div_ceil(page_size);
     let prev = wasm::memory_grow(0, pages);
 
     if prev == usize::max_value() {
-        return (ptr::null_mut(), 0, 0);
+        return None;
     }
 
     let prev_page = prev * page_size;
@@ -66,11 +78,12 @@ fn alloc_via_grow(size: usize, page_size: usize) -> (*mut u8, usize, u32) {
     // few bytes as being un-allocated meaning that the actual size of this
     // allocation won't be page aligned, which should be handled by
     // dlmalloc.
+    let base = ptr::NonNull::new(base_ptr)?;
     if prev_page.wrapping_add(size) == 0 {
-        return (base_ptr, size - 16, 0);
+        return Some((base, size - 16, 0));
     }
 
-    (base_ptr, size, 0)
+    Some((base, size, 0))
 }
 
 /// System setting for Wasm.
@@ -85,13 +98,15 @@ impl System {
 }
 
 unsafe impl Allocator for System {
-    fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+    fn alloc(&self, size: usize) -> Option<(ptr::NonNull<u8>, usize, u32)> {
         let page_size = self.page_size();
 
         if size != 0 {
             let chunk = preexisting_chunk_from_linker(size);
             if let Some((base, len)) = try_donate_preexisting(&PREEXISTING_USED, chunk) {
-                return (base as *mut u8, len, 0);
+                if let Some(base) = ptr::NonNull::new(base as *mut u8) {
+                    return Some((base, len, 0));
+                }
             }
         }
 

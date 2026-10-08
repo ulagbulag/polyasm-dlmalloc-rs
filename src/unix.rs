@@ -16,7 +16,7 @@ impl System {
 static mut LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
 
 unsafe impl Allocator for System {
-    fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+    fn alloc(&self, size: usize) -> Option<(ptr::NonNull<u8>, usize, u32)> {
         let addr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -28,9 +28,9 @@ unsafe impl Allocator for System {
             )
         };
         if addr == libc::MAP_FAILED {
-            (ptr::null_mut(), 0, 0)
+            None
         } else {
-            (addr.cast(), size, 0)
+            ptr::NonNull::new(addr.cast()).map(|base| (base, size, 0))
         }
     }
 

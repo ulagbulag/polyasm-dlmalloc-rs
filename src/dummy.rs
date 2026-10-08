@@ -12,8 +12,8 @@ impl System {
 }
 
 unsafe impl Allocator for System {
-    fn alloc(&self, _size: usize) -> (*mut u8, usize, u32) {
-        (ptr::null_mut(), 0, 0)
+    fn alloc(&self, _size: usize) -> Option<(ptr::NonNull<u8>, usize, u32)> {
+        None
     }
 
     fn remap(&self, _ptr: *mut u8, _oldsize: usize, _newsize: usize, _can_move: bool) -> *mut u8 {
@@ -39,4 +39,19 @@ unsafe impl Allocator for System {
     fn page_size(&self) -> usize {
         1
     }
+}
+
+#[cfg(feature = "global")]
+pub fn acquire_global_lock() {
+    // A target without a platform has no second thread to lock against.
+}
+
+#[cfg(feature = "global")]
+pub fn release_global_lock() {
+    // As in `acquire_global_lock`.
+}
+
+#[cfg(feature = "global")]
+pub unsafe fn enable_alloc_after_fork() {
+    // A target without a platform runs as one process.
 }
