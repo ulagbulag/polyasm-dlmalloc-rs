@@ -17,7 +17,7 @@ impl System {
 }
 
 unsafe impl Allocator for System {
-    fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+    fn alloc(&self, size: usize) -> Option<(ptr::NonNull<u8>, usize, u32)> {
         let addr = unsafe {
             VirtualAlloc(
                 ptr::null_mut(),
@@ -27,11 +27,7 @@ unsafe impl Allocator for System {
             )
         };
 
-        if addr.is_null() {
-            (ptr::null_mut(), 0, 0)
-        } else {
-            (addr.cast(), size, 0)
-        }
+        ptr::NonNull::new(addr.cast()).map(|base| (base, size, 0))
     }
 
     fn remap(&self, _ptr: *mut u8, _oldsize: usize, _newsize: usize, _can_move: bool) -> *mut u8 {

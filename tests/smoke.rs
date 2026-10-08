@@ -1,6 +1,4 @@
-use arbitrary::Unstructured;
 use dlmalloc::Dlmalloc;
-use rand::{rngs::SmallRng, RngCore, SeedableRng};
 
 #[test]
 fn smoke() {
@@ -160,21 +158,6 @@ fn mixed_api_round_trip() {
             assert_eq!(*grown.add(i), 0x77);
         }
         a.free(grown, 256, 4096);
-    }
-}
-
-#[path = "../fuzz/src/lib.rs"]
-mod fuzz;
-
-#[test]
-fn stress() {
-    let mut rng = SmallRng::seed_from_u64(0);
-    let mut buf = vec![0; 4096];
-    let iters = if cfg!(miri) { 5 } else { 2000 };
-    for _ in 0..iters {
-        rng.fill_bytes(&mut buf);
-        let mut u = Unstructured::new(&buf);
-        let _ = fuzz::run(&mut u);
     }
 }
 

@@ -56,7 +56,7 @@ unsafe impl Allocator for System {
     /// chunk of memory, as well as the size of the allocation and some
     /// flags. Since flags are unused on this platform, they will always
     /// be `0`.
-    fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+    fn alloc(&self, size: usize) -> Option<(ptr::NonNull<u8>, usize, u32)> {
         let size = if size == 0 {
             4096
         } else if size & 4095 == 0 {
@@ -67,9 +67,9 @@ unsafe impl Allocator for System {
 
         if let Ok((address, length)) = sys::increase_heap(size) {
             let start = address - size + length;
-            (start as *mut u8, size, 0)
+            ptr::NonNull::new(start as *mut u8).map(|base| (base, size, 0))
         } else {
-            (ptr::null_mut(), 0, 0)
+            None
         }
     }
 
