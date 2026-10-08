@@ -35,9 +35,11 @@ pub unsafe trait Allocator: Send {
     /// allocated memory region. `size` is the actual size of the region while `flags` specifies
     /// properties of the allocated region. If `EXTERN_BIT` (bit 0) set in flags, then we did not
     /// allocate this segment and so should not try to deallocate or merge with others.
-    /// This function can return a `std::ptr::null_mut()` when allocation fails (other values of
-    /// the triple will be ignored).
-    fn alloc(&self, size: usize) -> (*mut u8, usize, u32);
+    ///
+    /// A system that hands out no region answers `None`. The `Option` carries
+    /// the absence, and the base a caller receives is non-null in its type,
+    /// which the compiler reads directly.
+    fn alloc(&self, size: usize) -> Option<(ptr::NonNull<u8>, usize, u32)>;
 
     /// Remaps system memory region at `ptr` with size `oldsize` to a potential new location with
     /// size `newsize`. `can_move` indicates if the location is allowed to move to a completely new
@@ -74,7 +76,12 @@ pub unsafe trait Allocator: Send {
 pub struct Dlmalloc<A = System>(dlmalloc::Dlmalloc<A>);
 
 cfg_if::cfg_if! {
-    if #[cfg(target_family = "wasm")] {
+    if #[cfg(target_abi = "polyasm")] {
+        // PolyASM carries WebAssembly's family with a heap fixed at link
+        // time; the allocator takes that heap in one donation.
+        #[path = "polyasm.rs"]
+        mod sys;
+    } else if #[cfg(target_family = "wasm")] {
         #[path = "wasm.rs"]
         mod sys;
     } else if #[cfg(target_os = "windows")] {
@@ -169,7 +176,7 @@ impl<A: Allocator> Dlmalloc<A> {
     /// `GlobalAlloc::alloc` method contracts.
     #[inline]
     pub unsafe fn malloc(&mut self, size: usize, align: usize) -> *mut u8 {
-        self.c_memalign(align, size)
+        self.c_memalign(run_align(size, align), size)
     }
 
     /// Same as `malloc`, except if the allocation succeeds it's guaranteed to
@@ -178,7 +185,7 @@ impl<A: Allocator> Dlmalloc<A> {
     pub unsafe fn calloc(&mut self, size: usize, align: usize) -> *mut u8 {
         let ptr = self.malloc(size, align);
         if !ptr.is_null() && self.0.calloc_must_clear(ptr) {
-            ptr::write_bytes(ptr, 0, size);
+            clear_allocation(ptr, size);
         }
         ptr
     }
@@ -200,9 +207,12 @@ impl<A: Allocator> Dlmalloc<A> {
     ///
     /// Safety and contracts are otherwise largely governed by the
     /// `GlobalAlloc::dealloc` method contracts.
+    ///
+    /// The caller passes the alignment as part of that safety agreement; the
+    /// release path reads the chunk header alone, which records everything it
+    /// needs, so the parameter is named `_align`.
     #[inline]
-    pub unsafe fn free(&mut self, ptr: *mut u8, size: usize, align: usize) {
-        let _ = align;
+    pub unsafe fn free(&mut self, ptr: *mut u8, size: usize, _align: usize) {
         self.0.validate_size(ptr, size);
         self.c_free(ptr)
     }
@@ -244,10 +254,13 @@ impl<A: Allocator> Dlmalloc<A> {
     ) -> *mut u8 {
         self.0.validate_size(ptr, old_size);
 
-        if old_align <= self.0.malloc_alignment() {
+        let align = run_align(new_size, old_align);
+        if align <= self.0.malloc_alignment() {
             self.c_realloc(ptr, new_size)
+        } else if ptr as usize & (align - 1) == 0 && self.0.realloc_in_place(ptr, new_size) {
+            ptr
         } else {
-            let res = self.malloc(new_size, old_align);
+            let res = self.malloc(new_size, align);
             if !res.is_null() {
                 let size = cmp::min(old_size, new_size);
                 ptr::copy_nonoverlapping(ptr, res, size);
@@ -400,4 +413,71 @@ impl<A: Allocator> Dlmalloc<A> {
         }
         self.0.free(ptr)
     }
+}
+
+/// PolyASM requests of at least this many bytes start on a
+/// [`PAGE_RUN_ALIGN`] boundary. A runtime maps immutable file pages over such
+/// buffers (a read of a stored object lands as a file mapping, and a copy of
+/// one gets re-backed by it), and a file page lands only on a guest page at
+/// the same offset, so a run that starts on a page boundary takes every
+/// whole page of a file it holds from byte zero.
+#[cfg(target_abi = "polyasm")]
+const PAGE_RUN: usize = 1 << 20;
+
+/// The boundary a page run starts on: the widest host page a PolyASM lane
+/// runs on, so the run starts on a page boundary of every host.
+#[cfg(target_abi = "polyasm")]
+const PAGE_RUN_ALIGN: usize = 1 << 16;
+
+/// The alignment one request of `size` bytes asking for `align` gets.
+#[inline(always)]
+fn run_align(size: usize, align: usize) -> usize {
+    #[cfg(target_abi = "polyasm")]
+    if size >= PAGE_RUN {
+        return align.max(PAGE_RUN_ALIGN);
+    }
+    let _ = size;
+    align
+}
+
+/// Clear short allocations with bounded head/tail stores. PolyASM's current
+/// general fill instruction uses REP STOSB, whose startup cost exceeds these
+/// few stores. Overlap is harmless because every store writes zero; no byte
+/// beyond the requested allocation is touched.
+#[cfg(target_abi = "polyasm")]
+#[inline(always)]
+unsafe fn clear_small_allocation(ptr: *mut u8, size: usize) {
+    debug_assert!(size <= 64);
+    if size >= 8 {
+        ptr.cast::<u64>().write_unaligned(0);
+        ptr.add(size - 8).cast::<u64>().write_unaligned(0);
+        if size > 16 {
+            ptr.add(8).cast::<u64>().write_unaligned(0);
+            ptr.add(size - 16).cast::<u64>().write_unaligned(0);
+            if size > 32 {
+                ptr.add(16).cast::<u64>().write_unaligned(0);
+                ptr.add(24).cast::<u64>().write_unaligned(0);
+                ptr.add(size - 24).cast::<u64>().write_unaligned(0);
+                ptr.add(size - 32).cast::<u64>().write_unaligned(0);
+            }
+        }
+    } else if size >= 4 {
+        ptr.cast::<u32>().write_unaligned(0);
+        ptr.add(size - 4).cast::<u32>().write_unaligned(0);
+    } else if size >= 2 {
+        ptr.cast::<u16>().write_unaligned(0);
+        ptr.add(size - 2).cast::<u16>().write_unaligned(0);
+    } else if size == 1 {
+        ptr.write(0);
+    }
+}
+
+#[inline(always)]
+unsafe fn clear_allocation(ptr: *mut u8, size: usize) {
+    #[cfg(target_abi = "polyasm")]
+    if size <= 64 {
+        clear_small_allocation(ptr, size);
+        return;
+    }
+    ptr::write_bytes(ptr, 0, size);
 }

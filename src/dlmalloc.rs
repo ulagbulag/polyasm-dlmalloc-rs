@@ -34,6 +34,9 @@ pub struct Dlmalloc<A> {
     topsize: usize,
     dv: *mut Chunk,
     top: *mut Chunk,
+    /// The highest place the top chunk started at on a PolyASM heap: every
+    /// byte below it was handed out once, so its pages are touched already.
+    high: *mut Chunk,
     footprint: usize,
     max_footprint: usize,
     seg: Segment,
@@ -121,6 +124,7 @@ impl<A> Dlmalloc<A> {
             topsize: 0,
             dv: ptr::null_mut(),
             top: ptr::null_mut(),
+            high: ptr::null_mut(),
             footprint: 0,
             max_footprint: 0,
             seg: Segment {
@@ -320,8 +324,84 @@ impl<A: Allocator> Dlmalloc<A> {
         !self.system_allocator.allocates_zeros() || !Chunk::mmapped(Chunk::from_mem(ptr))
     }
 
+    /// Answers a request below one heap page straight from the one linked
+    /// PolyASM heap while its top chunk holds enough, and leaves the
+    /// complete allocator as the continuation for every other request.
+    ///
+    /// This method is deliberately small at the call site.  Allocation is a
+    /// loop primitive for Rust collections, and keeping the direct top split
+    /// here lets the compiler place it in that loop instead of entering the
+    /// full bin and segment implementation. Choosing the top before a released
+    /// chunk changes reuse order and keeps every allocator invariant. A
+    /// request of a page or more takes the continuation: it splits the top
+    /// while the request ends below the highest place the top reached, and
+    /// otherwise takes the bins and the designated victim before the top. A
+    /// guest that frees and allocates large buffers in turn keeps its heap in
+    /// pages it touched already, where the top split would walk every round
+    /// into fresh pages (one host page fault per 4 KiB) up to the end of the
+    /// linked heap, and a buffer that returns to the top keeps the place the
+    /// top split gives it.
+    ///
+    /// The page bound also guards the padding: `request2size` of a request
+    /// below one page stays at or above the request, so the fast path keeps
+    /// the two comparisons of the plain top split.
+    #[inline(always)]
     pub unsafe fn malloc(&mut self, size: usize) -> *mut u8 {
+        #[cfg(target_abi = "polyasm")]
+        {
+            let nb = self.request2size(size);
+            if nb < self.topsize && size < self.system_allocator.page_size() {
+                self.topsize -= nb;
+                let rsize = self.topsize;
+                let p = self.top;
+                self.top = Chunk::plus_offset(p, nb);
+                let r = self.top;
+                (*r).head = rsize | PINUSE;
+                Chunk::set_size_and_pinuse_of_inuse_chunk(p, nb);
+                return Chunk::to_mem(p);
+            }
+        }
+
+        self.malloc_slow(size)
+    }
+
+    /// Records the place of the top chunk before a release joins the top at
+    /// a lower address, so `high` keeps the highest place the top reached.
+    #[inline(always)]
+    fn keep_high(&mut self) {
+        #[cfg(target_abi = "polyasm")]
+        {
+            if self.top > self.high {
+                self.high = self.top;
+            }
+        }
+    }
+
+    #[cfg_attr(target_abi = "polyasm", inline(never))]
+    #[cfg_attr(not(target_abi = "polyasm"), inline)]
+    unsafe fn malloc_slow(&mut self, size: usize) -> *mut u8 {
         self.check_malloc_state();
+
+        // A request of a page or more splits the top while it ends below the
+        // highest place the top reached, in pages touched already; past that
+        // mark the released chunks come first.
+        #[cfg(target_abi = "polyasm")]
+        {
+            if size >= self.system_allocator.page_size() && size < self.max_request() {
+                let nb = self.pad_request(size);
+                let touched = (self.high as usize).saturating_sub(self.top as usize);
+                if nb < self.topsize && nb <= touched {
+                    self.topsize -= nb;
+                    let rsize = self.topsize;
+                    let p = self.top;
+                    self.top = Chunk::plus_offset(p, nb);
+                    let r = self.top;
+                    (*r).head = rsize | PINUSE;
+                    Chunk::set_size_and_pinuse_of_inuse_chunk(p, nb);
+                    return Chunk::to_mem(p);
+                }
+            }
+        }
 
         let nb;
         if size <= self.max_small_request() {
@@ -445,10 +525,10 @@ impl<A: Allocator> Dlmalloc<A> {
             self.granularity,
         );
 
-        let (tbase, tsize, flags) = self.system_allocator.alloc(asize);
-        if tbase.is_null() {
-            return tbase;
-        }
+        let Some((tbase, tsize, flags)) = self.system_allocator.alloc(asize) else {
+            return ptr::null_mut();
+        };
+        let tbase = tbase.as_ptr();
 
         self.footprint += tsize;
         self.max_footprint = cmp::max(self.max_footprint, self.footprint);
@@ -534,6 +614,19 @@ impl<A: Allocator> Dlmalloc<A> {
             self.free(oldmem);
         }
         return ptr;
+    }
+
+    /// Resizes the allocation at `oldmem` to `bytes` where it stands: by
+    /// splitting off its tail, or by taking the top or the free chunk behind
+    /// it. Answers whether it did.
+    pub unsafe fn realloc_in_place(&mut self, oldmem: *mut u8, bytes: usize) -> bool {
+        if bytes >= self.max_request() {
+            return false;
+        }
+        let nb = self.request2size(bytes);
+        !self
+            .try_realloc_chunk(Chunk::from_mem(oldmem), nb, false)
+            .is_null()
     }
 
     unsafe fn try_realloc_chunk(&mut self, p: *mut Chunk, nb: usize, can_move: bool) -> *mut Chunk {
@@ -747,6 +840,7 @@ impl<A: Allocator> Dlmalloc<A> {
         if !Chunk::cinuse(next) {
             // consolidate forward
             if next == self.top {
+                self.keep_high();
                 self.topsize += psize;
                 let tsize = self.topsize;
                 self.top = p;
@@ -1249,7 +1343,18 @@ impl<A: Allocator> Dlmalloc<A> {
         }
     }
 
+    /// Checks that the chunk behind `ptr` is the one a `size` request was
+    /// answered with.
+    ///
+    /// This reads the chunk header, the segment flags and two derived
+    /// overheads, while the header alone records everything `free` needs. The
+    /// read stands behind the same `debug` guard as the rest of this file's
+    /// checks, which keeps it off the release path of a regular build.
     pub unsafe fn validate_size(&mut self, ptr: *mut u8, size: usize) {
+        if !cfg!(all(feature = "debug", debug_assertions)) {
+            return;
+        }
+
         let p = Chunk::from_mem(ptr);
         let psize = Chunk::size(p);
 
@@ -1264,7 +1369,103 @@ impl<A: Allocator> Dlmalloc<A> {
         }
     }
 
+    /// Retires the contiguous allocation run of a linked PolyASM heap at the
+    /// call site and leaves every other free-list shape to the full release
+    /// path.
+    ///
+    /// The designated victim is the complete representation of the first
+    /// isolated release.  Releases immediately after it extend the same
+    /// chunk, and the release adjacent to the top joins both.  Those are
+    /// invariant-preserving allocator states rather than a workload promise:
+    /// any non-adjacent or occupied-victim shape falls through unchanged.
+    #[inline(always)]
     pub unsafe fn free(&mut self, mem: *mut u8) {
+        #[cfg(target_abi = "polyasm")]
+        self.free_linked(mem);
+        #[cfg(not(target_abi = "polyasm"))]
+        self.free_slow(mem);
+    }
+
+    /// Keeps repeated forward and reverse releases small enough to inline.
+    /// Creating a victim or joining it to the top happens only at a run's
+    /// boundary; outlining those cases also lets callers discard empty drops.
+    #[cfg(target_abi = "polyasm")]
+    #[inline(always)]
+    unsafe fn free_linked(&mut self, mem: *mut u8) {
+        let chunk = Chunk::from_mem(mem);
+        let size = Chunk::size(chunk);
+        let next = Chunk::plus_offset(chunk, size);
+
+        let dv_size = self.dvsize;
+        let dv = self.dv;
+        // Extending the existing victim leaves its address unchanged. Keep
+        // this common case before choosing a new victim or joining the top,
+        // so a sequence of adjacent releases neither selects nor rewrites it.
+        // An empty victim is null, so its wrapping end is null too and
+        // differs from the chunk of every valid allocation. The adjacency
+        // check thus excludes the empty state with zero extra hot-path
+        // branches.
+        if Chunk::plus_offset(dv, dv_size) == chunk && Chunk::cinuse(next) {
+            let joined_size = dv_size + size;
+            Chunk::set_free_with_pinuse(dv, joined_size, next);
+            self.dvsize = joined_size;
+            return;
+        }
+
+        // A tail whose predecessor is allocated joins the top directly,
+        // leaving the bins and the designated victim as they are.
+        if next == self.top && Chunk::pinuse(chunk) {
+            self.keep_high();
+            let top_size = self.topsize + size;
+            self.top = chunk;
+            self.topsize = top_size;
+            (*chunk).head = top_size | PINUSE;
+            return;
+        }
+
+        self.free_linked_slow(mem);
+    }
+
+    #[cfg(target_abi = "polyasm")]
+    #[inline(never)]
+    unsafe fn free_linked_slow(&mut self, mem: *mut u8) {
+        let chunk = Chunk::from_mem(mem);
+        let size = Chunk::size(chunk);
+        let next = Chunk::plus_offset(chunk, size);
+        let dv_size = self.dvsize;
+        let dv = self.dv;
+        let (previous, joined_size, contiguous) = if dv_size == 0 {
+            (chunk, size, Chunk::pinuse(chunk))
+        } else {
+            (dv, dv_size + size, Chunk::plus_offset(dv, dv_size) == chunk)
+        };
+
+        if contiguous {
+            if next == self.top {
+                self.keep_high();
+                let top_size = self.topsize + joined_size;
+                self.top = previous;
+                self.topsize = top_size;
+                (*previous).head = top_size | PINUSE;
+                self.dv = ptr::null_mut();
+                self.dvsize = 0;
+                return;
+            }
+
+            if Chunk::cinuse(next) {
+                Chunk::set_free_with_pinuse(previous, joined_size, next);
+                self.dv = previous;
+                self.dvsize = joined_size;
+                return;
+            }
+        }
+
+        self.free_slow(mem);
+    }
+
+    #[cfg_attr(target_abi = "polyasm", inline(never))]
+    #[cfg_attr(not(target_abi = "polyasm"), inline)]
+    unsafe fn free_slow(&mut self, mem: *mut u8) {
         self.check_malloc_state();
 
         let mut p = Chunk::from_mem(mem);
@@ -1299,6 +1500,7 @@ impl<A: Allocator> Dlmalloc<A> {
         // Consolidate forward if we can
         if !Chunk::cinuse(next) {
             if next == self.top {
+                self.keep_high();
                 self.topsize += psize;
                 let tsize = self.topsize;
                 self.top = p;
@@ -1829,7 +2031,10 @@ impl Chunk {
 
     unsafe fn set_free_with_pinuse(p: *mut Chunk, size: usize, n: *mut Chunk) {
         Chunk::clear_pinuse(n);
-        Chunk::set_size_and_pinuse_of_free_chunk(p, size);
+        (*p).head = size | PINUSE;
+        // The caller already found the next chunk. Its preceding-size field
+        // is this chunk's footer, even when a backward merge changed p.
+        (*n).prev_foot = size;
     }
 
     unsafe fn set_foot(me: *mut Chunk, size: usize) {

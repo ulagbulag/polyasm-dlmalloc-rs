@@ -28,6 +28,9 @@ doctest = false
 [target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
 libc = { version = "0.2", default-features = false }
 
+[target.'cfg(target_abi = "polyasm")'.dependencies]
+polyasm-format = { version = "0.1", default-features = false }
+
 [dependencies]
 cfg-if = "1.0"
 # This is an internal dep for supporting the nightly toolchain option `-Z build-std`:
